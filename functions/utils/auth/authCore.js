@@ -6,12 +6,12 @@
 import { fetchSecurityConfig } from '../sysConfig.js';
 import { validateApiToken } from './tokenValidator.js';
 import { getDatabase } from '../databaseAdapter.js';
-import { verifyPassword, needsRehash, hashPassword } from './passwordHash.js';
+import { verifyPassword } from './passwordHash.js';
 import { validateSession } from './sessionManager.js';
 
 /**
  * 认证范围常量
- * - 'admin'  : 仅管理员（admin session / API Token / Basic Auth）
+ * - 'admin'  : 仅管理员（admin session / API Token）
  * - 'user'   : 仅用户（user session / admin session / API Token / authCode）
  * - 'either' : 管理员或用户任一通过即可（所有认证方式）
  */
@@ -20,6 +20,64 @@ export const AUTH_SCOPE = {
     USER: 'user',
     EITHER: 'either',
 };
+
+const AUTHORIZED = (authType) => ({ authorized: true, authType });
+const UNAUTHORIZED = { authorized: false, authType: null };
+
+/**
+ * 管理员会话认证
+ * 检查 admin session
+ *
+ * @returns {Promise<{authorized: boolean, authType: string|null}|null>}
+ *          认证通过返回结果，未通过返回 null（交给调用方继续）
+ */
+async function checkAdmin({ env, request, adminConfigured }) {
+    if (!adminConfigured) {
+        return AUTHORIZED('admin'); // 未配置管理员认证，视为管理员身份放行
+    }
+
+    const session = await validateSession(env, request, 'admin');
+    if (session.valid) {
+        return AUTHORIZED('admin');
+    }
+
+    return null;
+}
+
+/**
+ * 用户会话/凭据认证
+ * 优先级：admin session → user session → authCode
+ *
+ * @returns {Promise<{authorized: boolean, authType: string|null}|null>}
+ *          认证通过/失败返回结果，无法判定返回 null
+ */
+async function checkUser({ env, request, url, authCodeConfigured, userAuthCode }) {
+    // admin session（管理员身份也可访问用户资源）
+    const adminSession = await validateSession(env, request, 'admin');
+    if (adminSession.valid) {
+        return AUTHORIZED('admin');
+    }
+
+    // user session
+    const userSession = await validateSession(env, request, 'user');
+    if (userSession.valid) {
+        return AUTHORIZED('user');
+    }
+
+    // authCode
+    if (!authCodeConfigured) {
+        return AUTHORIZED('user'); // 未配置用户认证，视为用户身份放行
+    }
+
+    if (url) {
+        const authCode = extractAuthCode(url, request);
+        if (authCode && await verifyPassword(authCode, userAuthCode)) {
+            return AUTHORIZED('user');
+        }
+    }
+
+    return UNAUTHORIZED;
+}
 
 /**
  * 统一认证函数
@@ -45,140 +103,33 @@ export async function authenticate({
     const adminPassword = securityConfig.auth.admin.adminPassword;
     const userAuthCode = securityConfig.auth.user.authCode;
 
-    const adminConfigured = !!(adminUsername && adminUsername.trim());
+    const adminConfigured = !!(adminUsername && adminUsername.trim()) || !!(adminPassword && adminPassword.trim());
     const authCodeConfigured = !!(userAuthCode && userAuthCode.trim());
 
-    const checkAdmin = authScope === AUTH_SCOPE.ADMIN || authScope === AUTH_SCOPE.EITHER;
-    const checkUser = authScope === AUTH_SCOPE.USER || authScope === AUTH_SCOPE.EITHER;
-
-    // 管理员未配置时，管理端认证视为不需要，直接放行
-    if (checkAdmin && !checkUser && !adminConfigured) {
-        return { authorized: true, authType: null };
-    }
-
-    // --- Session 验证 ---
-
-    // 1. admin session（管理员和用户场景都接受 admin session）
-    const adminSession = await validateSession(env, request, 'admin');
-    if (adminSession.valid) {
-        return { authorized: true, authType: 'admin' };
-    }
-
-    // 2. user session（仅用户场景接受，管理端不接受 user session）
-    if (checkUser) {
-        const userSession = await validateSession(env, request, 'user');
-        if (userSession.valid) {
-            return { authorized: true, authType: 'user' };
-        }
-    }
-
-    // --- Token 验证 ---
-
-    // 3. API Token
+    // --- API Token 验证（公共层，所有 scope 通用） ---
     const db = getDatabase(env);
     const tokenResult = await validateApiToken(request, db, requiredPermission);
     if (tokenResult.valid) {
-        return { authorized: true, authType: 'admin' };
+        return AUTHORIZED('admin');
     }
 
-    // --- 凭据验证 ---
+    // --- 会话/凭据验证 ---
+    const adminCtx = { env, request, adminConfigured };
+    const userCtx = { env, request, url, authCodeConfigured, userAuthCode };
 
-    // 4. Basic Auth（仅管理员场景）
-    if (checkAdmin && adminConfigured && request.headers.has('Authorization')) {
-        const basicResult = await verifyBasicAuth(request, adminUsername, adminPassword, env);
-        if (basicResult.valid) {
-            return { authorized: true, authType: 'admin' };
-        }
+    if (authScope === AUTH_SCOPE.ADMIN) {
+        return (await checkAdmin(adminCtx)) || UNAUTHORIZED;
     }
 
-    // 5. authCode（仅用户场景）
-    if (checkUser) {
-        if (authCodeConfigured) {
-            if (url) {
-                const authCode = extractAuthCode(url, request);
-                if (authCode && await verifyPassword(authCode, userAuthCode)) {
-                    return { authorized: true, authType: 'user' };
-                }
-            }
-            // authCode 已配置但验证失败，拒绝访问
-            return { authorized: false, authType: null };
-        }
-        // authCode 未配置，视为不需要用户端认证
+    if (authScope === AUTH_SCOPE.USER) {
+        return await checkUser(userCtx);
     }
 
-    // --- 兜底判断 ---
+    // EITHER: 任一通过即可
+    const adminResult = await checkAdmin(adminCtx);
+    if (adminResult?.authorized) return adminResult;
 
-    // 如果所有启用的认证方式都未配置凭据，视为无需认证
-    const needsAdmin = checkAdmin && adminConfigured;
-    const needsUser = checkUser && authCodeConfigured;
-
-    if (!needsAdmin && !needsUser) {
-        return { authorized: true, authType: null };
-    }
-
-    return { authorized: false, authType: null };
-}
-
-/**
- * Basic Auth 验证 + 自动 rehash
- */
-async function verifyBasicAuth(request, expectedUser, expectedPass, env) {
-    try {
-        const { user, pass } = parseBasicAuth(request);
-        const passwordMatch = await verifyPassword(pass, expectedPass);
-        if (user !== expectedUser || !passwordMatch) {
-            return { valid: false };
-        }
-
-        // 验证通过后，自动升级旧版哈希为 PBKDF2
-        if (needsRehash(expectedPass) || !expectedPass.startsWith('$pbkdf2$')) {
-            try {
-                const db = getDatabase(env);
-                const settingsStr = await db.get('manage@sysConfig@security');
-                if (settingsStr) {
-                    const settings = JSON.parse(settingsStr);
-                    if (settings.auth?.admin) {
-                        settings.auth.admin.adminPassword = await hashPassword(pass);
-                        await db.put('manage@sysConfig@security', JSON.stringify(settings));
-                    }
-                }
-            } catch (e) {
-                console.error('Failed to rehash admin password:', e);
-            }
-        }
-
-        return { valid: true };
-    } catch {
-        return { valid: false };
-    }
-}
-
-/**
- * 解析 Basic Auth 头
- */
-function parseBasicAuth(request) {
-    const auth = request.headers.get('Authorization');
-    if (!auth) {
-        throw new Error('No Authorization header');
-    }
-
-    const [scheme, encoded] = auth.split(' ');
-    if (scheme !== 'Basic' || !encoded) {
-        throw new Error('Invalid auth scheme');
-    }
-
-    const buffer = Uint8Array.from(atob(encoded), c => c.charCodeAt(0));
-    const decoded = new TextDecoder().decode(buffer).normalize();
-
-    const index = decoded.indexOf(':');
-    if (index === -1 || /[\0-\x1F\x7F]/.test(decoded)) {
-        throw new Error('Invalid authorization value');
-    }
-
-    return {
-        user: decoded.substring(0, index),
-        pass: decoded.substring(index + 1),
-    };
+    return await checkUser(userCtx);
 }
 
 /**
